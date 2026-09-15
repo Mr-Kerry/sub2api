@@ -205,6 +205,21 @@
           </div>
         </template>
 
+        <template #cell-cache_hit_rate="{ row }">
+          <div v-if="cacheHitRateData(row)" data-testid="cache-hit-rate-cell" class="space-y-0.5">
+            <span
+              class="inline-flex items-center rounded border px-1.5 py-0.5 text-xs font-medium tabular-nums"
+              :class="cacheHitRateClass(row)"
+            >
+              {{ cacheHitRateData(row)?.rate.toFixed(1) }}%
+            </span>
+            <div class="text-[11px] tabular-nums text-gray-400 dark:text-gray-500">
+              {{ formatCacheTokens(cacheHitRateData(row)?.read ?? 0) }} / {{ formatCacheTokens(cacheHitRateData(row)?.total ?? 0) }}
+            </div>
+          </div>
+          <span v-else data-testid="cache-hit-rate-cell" class="text-sm text-gray-400 dark:text-gray-500">-</span>
+        </template>
+
         <template #cell-cost="{ row }">
           <div class="text-sm">
             <div class="flex items-center gap-1.5">
@@ -722,6 +737,37 @@ const getRequestTypeBadgeClass = (row: AdminUsageLog): string => {
 
 const formatUserAgent = (ua: string): string => {
   return ua
+}
+
+type CacheHitRateData = { rate: number; read: number; total: number }
+
+/** Cache hit rate = cache reads / all prompt tokens (input + cache reads + cache writes). */
+const cacheHitRateData = (row: AdminUsageLog): CacheHitRateData | null => {
+  if (isImageUsage(row)) return null
+
+  const input = Number(row.input_tokens) || 0
+  const cacheRead = Number(row.cache_read_tokens) || 0
+  const cacheCreation = Number(row.cache_creation_tokens) || 0
+  const totalPromptTokens = input + cacheRead + cacheCreation
+  if (totalPromptTokens <= 0) return null
+
+  return {
+    rate: (cacheRead / totalPromptTokens) * 100,
+    read: cacheRead,
+    total: totalPromptTokens,
+  }
+}
+
+const cacheHitRateClass = (row: AdminUsageLog): string => {
+  const data = cacheHitRateData(row)
+  if (!data) return ''
+  if (data.rate >= 90) {
+    return 'border-emerald-300 bg-emerald-50 text-emerald-600 dark:border-emerald-500/50 dark:bg-emerald-500/10 dark:text-emerald-400'
+  }
+  if (data.rate >= 50) {
+    return 'border-amber-300 bg-amber-50 text-amber-600 dark:border-amber-500/50 dark:bg-amber-500/10 dark:text-amber-400'
+  }
+  return 'border-rose-300 bg-rose-50 text-rose-600 dark:border-rose-500/50 dark:bg-rose-500/10 dark:text-rose-400'
 }
 
 // 超过 1 分钟简化为 "Xm Ys"，免去人工换算（超过 1 小时再进位为 "Xh Ym"）

@@ -2814,7 +2814,7 @@ func openAIUpstreamCostFactors(accounts []*Account, now time.Time, oauthScheduli
 			continue
 		}
 		factors[account.ID] = openAIUpstreamCostNeutralFactor
-		if !account.IsOpenAIApiKey() && !account.IsOpenAIOAuthLike() {
+		if !upstreamRateSchedulableAccount(account) {
 			continue
 		}
 		eligibleCount++
@@ -2875,10 +2875,9 @@ func newOpenAILegacyUpstreamRateOrder(accounts []*Account, now time.Time, oauthS
 		if account == nil {
 			continue
 		}
-		// 与 openAIUpstreamCostFactors 使用同一道平台门控：只有 OpenAI 平台账号
-		// 的倍率参与 legacy 低倍率优先排序。上游自报倍率来自中转方，不能让它对
-		// 其他平台的调度产生影响——否则自报低价即可吸走流量，而实际结算走本地倍率。
-		if !account.IsOpenAIApiKey() && !account.IsOpenAIOAuthLike() {
+		// Use the same eligibility scope as weighted cost scoring.
+		// Declared upstream rates are scheduling signals, not verified costs.
+		if !upstreamRateSchedulableAccount(account) {
 			continue
 		}
 		rate, ok := openAISchedulingRate(account, now, oauthSchedulingRateMultiplier)
@@ -2893,6 +2892,19 @@ func newOpenAILegacyUpstreamRateOrder(accounts []*Account, now time.Time, oauthS
 		rates[account.ID] = rate
 	}
 	return openAILegacyUpstreamRateOrder{enabled: len(rates) >= 2 && distinct, rates: rates}
+}
+
+// upstreamRateSchedulableAccount preserves existing OpenAI support
+// and allows Grok API-key accounts to use declared upstream rates.
+func upstreamRateSchedulableAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+
+	return account.IsOpenAIApiKey() ||
+		account.IsOpenAIOAuthLike() ||
+		(account.Platform == PlatformGrok &&
+			account.Type == AccountTypeAPIKey)
 }
 
 func openAISchedulingRate(account *Account, now time.Time, oauthSchedulingRateMultiplier float64) (float64, bool) {

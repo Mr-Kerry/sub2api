@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -402,16 +401,17 @@ func TestOpenAIFreshUpstreamBillingRateRecomputesPeakAtSelectionTime(t *testing.
 		"timezone":                  "UTC",
 	}
 
-	duringPeak, ok := openAIFreshUpstreamBillingRate(account, time.Date(2026, 7, 13, 17, 59, 0, 0, time.UTC))
+	account.RateMultiplier = floatPtr(0.1)
+	duringPeak, ok := openAISchedulingRate(account, time.Date(2026, 7, 13, 17, 59, 0, 0, time.UTC), nil)
 	require.True(t, ok)
 	require.Equal(t, 0.8, duringPeak)
 
-	afterPeak, ok := openAIFreshUpstreamBillingRate(account, time.Date(2026, 7, 13, 18, 1, 0, 0, time.UTC))
+	afterPeak, ok := openAISchedulingRate(account, time.Date(2026, 7, 13, 18, 1, 0, 0, time.UTC), nil)
 	require.True(t, ok)
 	require.Equal(t, 0.4, afterPeak)
 }
 
-func TestOpenAIUpstreamCostFactorsSparseProbeIsNeutral(t *testing.T) {
+func TestOpenAIUpstreamCostFactorsEqualProbeAndFallbackRatesAreNeutral(t *testing.T) {
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	accounts := make([]*Account, 0, 10)
 	accounts = append(accounts, upstreamCostTestAccount(1, UpstreamBillingProbeStatusOK, 1, now.Add(-time.Minute), 30*time.Minute))
@@ -430,13 +430,13 @@ func TestOpenAIUpstreamCostFactorsSparseProbeIsNeutral(t *testing.T) {
 		})
 	}
 
-	factors := openAIUpstreamCostFactors(accounts, now, defaultOpenAIOAuthSchedulingRateMultiplier)
+	factors := openAIUpstreamCostFactors(accounts, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 	for id := int64(1); id <= 10; id++ {
 		require.Equal(t, openAIUpstreamCostNeutralFactor, factors[id])
 	}
 }
 
-func TestOpenAIUpstreamCostFactorsCoverageShrinksSparseSignal(t *testing.T) {
+func TestOpenAIUpstreamCostFactorsIncludeAccountFallbacksInCoverage(t *testing.T) {
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	accounts := []*Account{
 		upstreamCostTestAccount(1, UpstreamBillingProbeStatusOK, 0.03, now.Add(-time.Minute), 30*time.Minute),
@@ -446,10 +446,10 @@ func TestOpenAIUpstreamCostFactorsCoverageShrinksSparseSignal(t *testing.T) {
 		accounts = append(accounts, &Account{ID: id, Platform: PlatformOpenAI, Type: AccountTypeAPIKey})
 	}
 
-	factors := openAIUpstreamCostFactors(accounts, now, defaultOpenAIOAuthSchedulingRateMultiplier)
-	center := math.Sqrt(0.03 * 0.8)
-	require.InDelta(t, 0.5+0.2*(1/(1+0.03/center)-0.5), factors[1], 1e-12)
-	require.InDelta(t, 0.5+0.2*(1/(1+0.8/center)-0.5), factors[2], 1e-12)
+	factors := openAIUpstreamCostFactors(accounts, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
+	// Eight unprobed accounts default to 1x, so the median is 1 and coverage is complete.
+	require.InDelta(t, 1/(1+0.03), factors[1], 1e-12)
+	require.InDelta(t, 1/(1+0.8), factors[2], 1e-12)
 	require.Equal(t, openAIUpstreamCostNeutralFactor, factors[3])
 }
 
@@ -461,7 +461,7 @@ func TestOpenAIUpstreamCostFactorsUseMedianAgainstOutlier(t *testing.T) {
 		upstreamCostTestAccount(3, UpstreamBillingProbeStatusOK, 100, now.Add(-time.Minute), 30*time.Minute),
 	}
 
-	factors := openAIUpstreamCostFactors(accounts, now, defaultOpenAIOAuthSchedulingRateMultiplier)
+	factors := openAIUpstreamCostFactors(accounts, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 	require.InDelta(t, 2.0/3.0, factors[1], 1e-12)
 	require.InDelta(t, 0.5, factors[2], 1e-12)
 	require.InDelta(t, 1/(1+100/0.2), factors[3], 1e-12)
@@ -472,20 +472,21 @@ func TestOpenAILegacyUpstreamRateOrderRequiresComparableRates(t *testing.T) {
 	oneKnown := newOpenAILegacyUpstreamRateOrder([]*Account{
 		upstreamCostTestAccount(1, UpstreamBillingProbeStatusOK, 0.03, now.Add(-time.Minute), 30*time.Minute),
 		{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
-	}, now, defaultOpenAIOAuthSchedulingRateMultiplier)
-	require.False(t, oneKnown.enabled)
+	}, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
+	require.True(t, oneKnown.enabled)
+	require.Equal(t, 1.0, oneKnown.rates[2])
 
 	allEqual := newOpenAILegacyUpstreamRateOrder([]*Account{
 		upstreamCostTestAccount(1, UpstreamBillingProbeStatusOK, 0.3, now.Add(-time.Minute), 30*time.Minute),
 		upstreamCostTestAccount(2, UpstreamBillingProbeStatusOK, 0.3, now.Add(-time.Minute), 30*time.Minute),
-	}, now, defaultOpenAIOAuthSchedulingRateMultiplier)
+	}, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 	require.False(t, allEqual.enabled)
 
 	distinct := newOpenAILegacyUpstreamRateOrder([]*Account{
 		upstreamCostTestAccount(1, UpstreamBillingProbeStatusOK, 0.03, now.Add(-time.Minute), 30*time.Minute),
 		upstreamCostTestAccount(2, UpstreamBillingProbeStatusOK, 0.8, now.Add(-time.Minute), 30*time.Minute),
 		{ID: 3, Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
-	}, now, defaultOpenAIOAuthSchedulingRateMultiplier)
+	}, now, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 	require.True(t, distinct.enabled)
 	require.Negative(t, distinct.compare(&Account{ID: 1}, &Account{ID: 2}))
 	require.Negative(t, distinct.compare(&Account{ID: 2}, &Account{ID: 3}))
@@ -515,21 +516,21 @@ func TestOpenAILegacyUpstreamRateOrderRequiresComparableRates(t *testing.T) {
 // 	require.Equal(t, openAIUpstreamCostNeutralFactor, factors[grokCheap.ID])
 // 	require.Equal(t, openAIUpstreamCostNeutralFactor, factors[anthropicExpensive.ID])
 
-// 	// 混合候选集里，非 OpenAI 账号既不进 rates 也不影响 OpenAI 账号之间的排序。
-// 	openAICheap := upstreamCostTestAccount(3, UpstreamBillingProbeStatusOK, 0.02, now.Add(-time.Minute), 30*time.Minute)
-// 	openAIExpensive := upstreamCostTestAccount(4, UpstreamBillingProbeStatusOK, 0.12, now.Add(-time.Minute), 30*time.Minute)
-// 	mixed := newOpenAILegacyUpstreamRateOrder(
-// 		[]*Account{grokCheap, openAICheap, anthropicExpensive, openAIExpensive},
-// 		now, defaultOpenAIOAuthSchedulingRateMultiplier,
-// 	)
-// 	require.True(t, mixed.enabled)
-// 	require.Len(t, mixed.rates, 2)
-// 	require.NotContains(t, mixed.rates, grokCheap.ID)
-// 	require.NotContains(t, mixed.rates, anthropicExpensive.ID)
-// 	require.Negative(t, mixed.compare(openAICheap, openAIExpensive))
-// 	// 自报 0.01 的 grok 账号没有已知倍率，排在有倍率的 OpenAI 账号之后。
-// 	require.Positive(t, mixed.compare(grokCheap, openAIExpensive))
-// }
+//		// 混合候选集里，非 OpenAI 账号既不进 rates 也不影响 OpenAI 账号之间的排序。
+//		openAICheap := upstreamCostTestAccount(3, UpstreamBillingProbeStatusOK, 0.02, now.Add(-time.Minute), 30*time.Minute)
+//		openAIExpensive := upstreamCostTestAccount(4, UpstreamBillingProbeStatusOK, 0.12, now.Add(-time.Minute), 30*time.Minute)
+//		mixed := newOpenAILegacyUpstreamRateOrder(
+//			[]*Account{grokCheap, openAICheap, anthropicExpensive, openAIExpensive},
+//			now, defaultOpenAIOAuthSchedulingRateMultiplier,
+//		)
+//		require.True(t, mixed.enabled)
+//		require.Len(t, mixed.rates, 2)
+//		require.NotContains(t, mixed.rates, grokCheap.ID)
+//		require.NotContains(t, mixed.rates, anthropicExpensive.ID)
+//		require.Negative(t, mixed.compare(openAICheap, openAIExpensive))
+//		// 自报 0.01 的 grok 账号没有已知倍率，排在有倍率的 OpenAI 账号之后。
+//		require.Positive(t, mixed.compare(grokCheap, openAIExpensive))
+//	}
 func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 	now := time.Now()
 	makeAccount := func(id int64, platform string, rate float64) *Account {
@@ -550,7 +551,7 @@ func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 	t.Run("legacy compares Grok API keys only", func(t *testing.T) {
 		order := newOpenAILegacyUpstreamRateOrder(
 			[]*Account{expensive, cheap, anthropic, grokOAuth, nil},
-			now, 1.0,
+			now, floatPtr(1.0),
 		)
 
 		require.True(t, order.enabled)
@@ -564,7 +565,7 @@ func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 	t.Run("weighted costs favor cheaper Grok API keys", func(t *testing.T) {
 		factors := openAIUpstreamCostFactors(
 			[]*Account{cheap, expensive, anthropic, grokOAuth, nil},
-			now, 1.0,
+			now, floatPtr(1.0),
 		)
 
 		require.Greater(t, factors[cheap.ID], openAIUpstreamCostNeutralFactor)
@@ -582,7 +583,7 @@ func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 			Type:     AccountTypeSetupToken,
 		}
 		pool := []*Account{openAIKey, oauth, setupToken, expensive}
-		order := newOpenAILegacyUpstreamRateOrder(pool, now, 0.05)
+		order := newOpenAILegacyUpstreamRateOrder(pool, now, floatPtr(0.05))
 
 		require.True(t, order.enabled)
 		require.Len(t, order.rates, 4)
@@ -591,13 +592,13 @@ func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 		require.Negative(t, order.compare(openAIKey, oauth))
 		require.Negative(t, order.compare(oauth, expensive))
 
-		factors := openAIUpstreamCostFactors(pool, now, 0.05)
+		factors := openAIUpstreamCostFactors(pool, now, floatPtr(0.05))
 		require.Greater(t, factors[openAIKey.ID], factors[oauth.ID])
 		require.Greater(t, factors[oauth.ID], factors[expensive.ID])
 		require.Equal(t, factors[oauth.ID], factors[setupToken.ID])
 	})
 
-	t.Run("stale and missing Grok probes remain unusable", func(t *testing.T) {
+	t.Run("stale and missing Grok probes fall back to local rates", func(t *testing.T) {
 		stale := upstreamCostTestAccount(
 			8, UpstreamBillingProbeStatusOK, 0.001,
 			now.Add(-3*time.Hour), 30*time.Minute,
@@ -609,15 +610,15 @@ func TestUpstreamRateSchedulingIncludesGrokAPIKey(t *testing.T) {
 			Type:     AccountTypeAPIKey,
 		}
 		pool := []*Account{cheap, expensive, stale, missing}
-		order := newOpenAILegacyUpstreamRateOrder(pool, now, 1.0)
+		order := newOpenAILegacyUpstreamRateOrder(pool, now, floatPtr(1.0))
 
-		require.Len(t, order.rates, 2)
-		require.NotContains(t, order.rates, stale.ID)
-		require.NotContains(t, order.rates, missing.ID)
+		require.Len(t, order.rates, 4)
+		require.Equal(t, stale.BillingRateMultiplier(), order.rates[stale.ID])
+		require.Equal(t, missing.BillingRateMultiplier(), order.rates[missing.ID])
 
-		factors := openAIUpstreamCostFactors(pool, now, 1.0)
-		require.Equal(t, openAIUpstreamCostNeutralFactor, factors[stale.ID])
-		require.Equal(t, openAIUpstreamCostNeutralFactor, factors[missing.ID])
+		factors := openAIUpstreamCostFactors(pool, now, floatPtr(1.0))
+		require.Less(t, factors[stale.ID], factors[expensive.ID])
+		require.Equal(t, factors[stale.ID], factors[missing.ID])
 		require.Greater(t, factors[cheap.ID], factors[expensive.ID])
 	})
 }
@@ -628,12 +629,12 @@ func TestOpenAISchedulingRatePlacesOAuthAtConfiguredReference(t *testing.T) {
 	oauth := upstreamCostTestOAuthAccount(2)
 	expensive := upstreamCostTestAccount(3, UpstreamBillingProbeStatusOK, 0.12, now.Add(-time.Minute), 30*time.Minute)
 
-	order := newOpenAILegacyUpstreamRateOrder([]*Account{cheap, oauth, expensive}, now, 0.05)
+	order := newOpenAILegacyUpstreamRateOrder([]*Account{cheap, oauth, expensive}, now, floatPtr(0.05))
 	require.True(t, order.enabled)
 	require.Negative(t, order.compare(cheap, oauth))
 	require.Negative(t, order.compare(oauth, expensive))
 
-	factors := openAIUpstreamCostFactors([]*Account{cheap, oauth, expensive}, now, 0.05)
+	factors := openAIUpstreamCostFactors([]*Account{cheap, oauth, expensive}, now, floatPtr(0.05))
 	require.Greater(t, factors[cheap.ID], factors[oauth.ID])
 	require.Greater(t, factors[oauth.ID], factors[expensive.ID])
 }
@@ -925,9 +926,9 @@ func TestBuildOpenAIAccountSchedulerScoreSnapshotUpstreamCostIsExactNoOpWithoutS
 		2: {AccountID: 2, LoadRate: 80},
 	}
 	weights := GatewayOpenAIWSSchedulerScoreWeightsView{Priority: 1, Load: 1, Queue: 0.7, ErrorRate: 0.8, TTFT: 0.5}
-	baseline := buildOpenAIAccountSchedulerScoreSnapshot(accounts, loadMap, weights, false, defaultOpenAIOAuthSchedulingRateMultiplier)
+	baseline := buildOpenAIAccountSchedulerScoreSnapshot(accounts, loadMap, weights, false, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 	weights.UpstreamCost = 1.5
-	withCost := buildOpenAIAccountSchedulerScoreSnapshot(accounts, loadMap, weights, false, defaultOpenAIOAuthSchedulingRateMultiplier)
+	withCost := buildOpenAIAccountSchedulerScoreSnapshot(accounts, loadMap, weights, false, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 
 	require.Equal(t, baseline, withCost)
 }
@@ -939,7 +940,7 @@ func TestBuildOpenAIAccountSchedulerScoreSnapshotUsesUpstreamCostSignal(t *testi
 		upstreamCostTestAccount(2, UpstreamBillingProbeStatusOK, 0.8, now.Add(-time.Minute), 30*time.Minute),
 	}
 	weights := GatewayOpenAIWSSchedulerScoreWeightsView{UpstreamCost: 1.5}
-	scores := buildOpenAIAccountSchedulerScoreSnapshot(accounts, nil, weights, false, defaultOpenAIOAuthSchedulingRateMultiplier)
+	scores := buildOpenAIAccountSchedulerScoreSnapshot(accounts, nil, weights, false, floatPtr(defaultOpenAIOAuthSchedulingRateMultiplier))
 
 	require.Greater(t, scores[1].BaseScore, scores[2].BaseScore)
 }
